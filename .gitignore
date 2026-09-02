@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+
+# Exported historical data (large binary files — don't commit market data)
+data/
+
+# OS/editor cruft
+.DS_Store
+.vscode/
+.idea/
+
+# Old reference file kept locally for porting, not part of the repo
+fetch_forex_data_v5_FINAL.py
