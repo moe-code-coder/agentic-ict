@@ -369,6 +369,30 @@ def detect_structure_events(df: pd.DataFrame) -> pd.DataFrame:
         else:
             df[c] = ""
 
+    # CRITICAL FIX (found via real-data testing, confirmed present in v5
+    # unchanged): v5 checked `Pivot_High_Confirmation_Time.iloc[i] <= t`
+    # where t IS df["time"].iloc[i] — but a pivot's confirmation time
+    # (recorded at its own origin row) is always PIVOT_PERIOD bars in
+    # the future relative to that same row's own time. That comparison
+    # is mathematically always False, so confirmed_highs/confirmed_lows
+    # were NEVER populated, so Sweep (and therefore MSS and BOS, which
+    # depend on it) NEVER fired — on any data, ever, in the original
+    # file. Fixed here by indexing pivots by confirmation time up front
+    # and admitting each one once the loop's current row reaches it.
+    ph_queue = sorted(
+        (t_, float(v)) for t_, v in
+        zip(df.loc[df["Pivot_High"].notna(), "Pivot_High_Confirmation_Time"],
+            df.loc[df["Pivot_High"].notna(), "Pivot_High"])
+        if pd.notna(t_)
+    )
+    pl_queue = sorted(
+        (t_, float(v)) for t_, v in
+        zip(df.loc[df["Pivot_Low"].notna(), "Pivot_Low_Confirmation_Time"],
+            df.loc[df["Pivot_Low"].notna(), "Pivot_Low"])
+        if pd.notna(t_)
+    )
+    ph_ptr = pl_ptr = 0
+
     confirmed_highs: list[tuple[pd.Timestamp, float]] = []
     confirmed_lows: list[tuple[pd.Timestamp, float]] = []
     pending_sweep = None
@@ -380,15 +404,12 @@ def detect_structure_events(df: pd.DataFrame) -> pd.DataFrame:
         high = df["High"].iloc[i]
         low = df["Low"].iloc[i]
 
-        ph = df["Pivot_High"].iloc[i]
-        ph_conf = df["Pivot_High_Confirmation_Time"].iloc[i]
-        pl = df["Pivot_Low"].iloc[i]
-        pl_conf = df["Pivot_Low_Confirmation_Time"].iloc[i]
-
-        if pd.notna(ph) and pd.notna(ph_conf) and ph_conf <= t:
-            confirmed_highs.append((ph_conf, float(ph)))
-        if pd.notna(pl) and pd.notna(pl_conf) and pl_conf <= t:
-            confirmed_lows.append((pl_conf, float(pl)))
+        while ph_ptr < len(ph_queue) and ph_queue[ph_ptr][0] <= t:
+            confirmed_highs.append(ph_queue[ph_ptr])
+            ph_ptr += 1
+        while pl_ptr < len(pl_queue) and pl_queue[pl_ptr][0] <= t:
+            confirmed_lows.append(pl_queue[pl_ptr])
+            pl_ptr += 1
 
         prior_high = confirmed_highs[-1][1] if confirmed_highs else np.nan
         prior_low = confirmed_lows[-1][1] if confirmed_lows else np.nan
@@ -406,8 +427,16 @@ def detect_structure_events(df: pd.DataFrame) -> pd.DataFrame:
             df.at[i, "Sweep_Time"] = t
             pending_sweep = {"direction": "Bullish", "time": t, "level": prior_low}
 
+        # MSS after sweep (FIX vs v5 — see primitives.py module note below):
+        # a Bullish sweep (sell-side liquidity swept, bullish reversal
+        # thesis) is confirmed by MSS breaking ABOVE a confirmed high
+        # (Bullish MSS) — the SAME bias the sweep implied, per prompt
+        # Sec. 7 ("break of a relevant opposing swing" continuing the
+        # thesis). v5 had this inverted (bearish sweep -> bullish MSS),
+        # which — combined with the confirmation-timing bug above — meant
+        # no setup could ever reach S3 on any real data.
         if pending_sweep:
-            if pending_sweep["direction"] == "Bearish" and pd.notna(prior_high):
+            if pending_sweep["direction"] == "Bullish" and pd.notna(prior_high):
                 opposing = [x for x in confirmed_highs if x[0] <= pending_sweep["time"]]
                 if opposing and close > opposing[-1][1]:
                     df.at[i, "MSS_Event"] = "Confirmed"
@@ -416,7 +445,7 @@ def detect_structure_events(df: pd.DataFrame) -> pd.DataFrame:
                     df.at[i, "MSS_Time"] = t
                     pending_mss = {"direction": "Bullish", "time": t}
                     pending_sweep = None
-            elif pending_sweep["direction"] == "Bullish" and pd.notna(prior_low):
+            elif pending_sweep["direction"] == "Bearish" and pd.notna(prior_low):
                 opposing = [x for x in confirmed_lows if x[0] <= pending_sweep["time"]]
                 if opposing and close < opposing[-1][1]:
                     df.at[i, "MSS_Event"] = "Confirmed"
